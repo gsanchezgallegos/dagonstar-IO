@@ -722,7 +722,7 @@ class Task(Thread):
         :param body: Script body
         :return: Script body with the command
         """
-        return body + " | tee " + quote(self.working_dir + "/.dagon/stdout.txt") + "\n"
+        return "{ " + body + " || kill -9 $$ ; } | tee " + quote(self.working_dir + "/.dagon/stdout.txt") + "\n"
 
     # Post process the command
     def post_process_command(self, command):
