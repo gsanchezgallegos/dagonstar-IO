@@ -1,4 +1,5 @@
 import logging
+import os
 import shutil
 import glob
 from json import loads, dumps
@@ -538,15 +539,31 @@ class Task(Thread):
         # Optional: remove trailing newline if needed
         unescaped_output = unescaped_output.strip()
 
-            
         self.set_info(loads(unescaped_output))
 
         # start the creation of the launcher.sh script
         # Create the header
+        # TODO: change "+" to ".join"
         header = header + "# Change the current directory to the working directory\n"
+
+        h_conf = os.getenv("MOUNT_POINT_CONF")
+        if h_conf is not None:
+            h_conf = "export " + h_conf + "\n"
+            header = header + h_conf
+
+        h_preload = os.getenv("MOUNT_POINT_LPATH")
+        if h_preload is not None:
+            h_preload = "export " + h_preload + "\n"
+            header = header + h_preload
+
+        h_mount_point = os.getenv("MOUNT_POINT")
+        if h_mount_point is None:
+            h_mount_point = self.working_dir
+
+        self.logger.debug(f"I/O directory: {h_mount_point}")
+
         header = header + "cd " + self.working_dir + "\n"
         header = header + "if [ $? -ne 0 ]; then code=1; fi \n\n"
-        header = header + "# Start staging in\n\n"
 
         # Create the body
         body = command
@@ -580,22 +597,32 @@ class Task(Thread):
 
             # Split each argument in elements by the slash
             elements = arg.split("/")
+            self.logger.debug(f"elements={elements}")
 
             # Extract the referenced task's workflow name
             workflow_name = elements[0]
+            self.logger.debug(f"workflow_name={workflow_name}")
 
             # The task name is the first element
             task_name = elements[1]
+            self.logger.debug(f"task_name={task_name}")
 
-            # Get the rest of the string as local path
-            local_path = "/" + "/".join(elements[2:])
+            # Identify if the path explicitly requests absolute routing via double slash
+            is_absolute = len(elements) > 2 and elements[2] == "/"
+
+            if is_absolute:
+                # Extract the raw absolute path from the source task
+                local_path = "/" + "/".join(elements[3:])
+            else:
+                # # Get the rest of the string as local path
+                # local_path = "/" + "/".join(elements[2:])
+                local_path = None
 
             # Set the default workflow name if needed
             if workflow_name is None or workflow_name == "":
                 workflow_name = self.workflow.name
 
             # Extract the reference task object
-            # task = self.workflow.find_task_by_name(workflow_name, task_name)
             if self.workflows is None:
                 task = self.workflow.find_task_by_name(
                     workflow_name, task_name)
@@ -604,13 +631,13 @@ class Task(Thread):
                     task = wf.find_task_by_name(workflow_name, task_name)
                     if task is not None:
                         break
-
+            self.logger.debug(f"task={task}, local path={local_path}")
             if task is None:  # if is None means that task is from another WF maybe in the dagon service
                 if self.workflow.is_api_available:
                     workflow_id = self.workflow.api.get_workflow_by_name(
                         workflow_name)
                     response = self.workflow.api.get_task(workflow_id,
-                                                          task_name)  # get the task from the external workflow
+                                                        task_name)  # get the task from the external workflow
                     transversal_task = response['task']
                     host_ip = response['host']
                     # if the host is the same in this computer, the task is in the same computer
@@ -627,67 +654,80 @@ class Task(Thread):
                         # we need to download the data from the ftp host
 
                     task = DagonTask(TaskType[transversal_task['type'].upper()], transversal_task['name'],
-                                     transversal_task['command'],
-                                     transversal_workflow=workflow_id, working_dir=task_path)
+                                    transversal_task['command'],
+                                    transversal_workflow=workflow_id, working_dir=task_path)
 
             # Check if the referenced task is consistent
-            if task is not None:
-                # Evaluate the destination path
-                dst_path = self.working_dir + "/.dagon/inputs/" + workflow_name + "/" + task_name
+            if task is not None and local_path is not None:
+                if is_absolute:
+                    # Enforce data isolation simulation by staging into a task-isolated Hercules directory
+                    dst_path = path.join(h_mount_point, path.basename(self.working_dir), "inputs", task_name)
+                    target_read_path = dst_path + "/" + path.basename(local_path)
+                else:
+                    # Evaluate the destination path
+                    dst_path = self.working_dir + "/.dagon/inputs/" + workflow_name + "/" + task_name
+                    target_read_path = dst_path + "/" + local_path
+
+                self.logger.debug(f"target_read_path={target_read_path}")
 
                 # Create the destination directory
+                header = header + "# Start staging in\n\n"
                 header = header + "\n\n# Create the destination directory\n"
-                header = header + "mkdir -p " + quote(dst_path + "/" + path.dirname(local_path)) + "\n"
+                header = header + "mkdir -p " + quote(dst_path) + "\n"
                 header = header + "if [ $? -ne 0 ]; then code=1; fi\n\n"
+                
                 # Add the move data command
-                header = header + \
-                    stager.stage_in(self, task, dst_path, local_path)
+                header = header + stager.stage_in(self, task, dst_path, local_path)
 
                 if self.mode == "parallel":
-                    files = glob.glob(
-                        task.get_scratch_dir() + "/" + local_path)
+                    if is_absolute:
+                        files = glob.glob(local_path)
+                    else:
+                        files = glob.glob(task.get_scratch_dir() + "/" + local_path)
+                        
                     taskType = TaskType[type(self).__name__.upper()]
 
                     for file in files:
                         filename, _ = path.splitext(path.basename(file))
                         taskParallelName = "{}_{}".format(self.name, filename)
-                        cmd = body.replace(
-                            dagon.Workflow.SCHEMA + arg, " workflow:///" + self.name + "/" + path.basename(file))
+                        
+                        replacement = file if is_absolute else " workflow:///" + self.name + "/" + path.basename(file)
+                        cmd = body.replace(dagon.Workflow.SCHEMA + arg, replacement)
 
-                        if type(self) == dagon.batch.Batch:
+                        if isinstance(self, dagon.batch.Batch):
                             parallel_task = DagonTask(taskType, taskParallelName, cmd,
-                                                      transversal_workflow=self.transversal_workflow)
+                                                    transversal_workflow=self.transversal_workflow)
 
-                        if type(self) == dagon.batch.RemoteBatch:
+                        elif isinstance(self, dagon.batch.RemoteBatch):
                             parallel_task = DagonTask(taskType, taskParallelName, cmd, ssh_username=self.ssh_username,
-                                                      keypath=self.keypath, ip=self.ip)
+                                                    keypath=self.keypath, ip=self.ip)
 
-                        elif type(self) == dagon.batch.Slurm:
+                        elif isinstance(self, dagon.batch.Slurm):
                             parallel_task = DagonTask(taskType, taskParallelName, cmd, partition=self.partition,
-                                                      ntasks=self.ntasks, memory=self.memory)
+                                                    ntasks=self.ntasks, memory=self.memory)
 
-                        elif type(self) == dagon.batch.RemoteSlurm:
+                        elif isinstance(self, dagon.batch.RemoteSlurm):
                             parallel_task = DagonTask(taskType, taskParallelName, cmd, partition=self.partition,
-                                                      ntasks=self.ntasks, memory=self.memory,
-                                                      ssh_username=self.ssh_username, keypath=self.keypath, ip=self.ip)
+                                                    ntasks=self.ntasks, memory=self.memory,
+                                                    ssh_username=self.ssh_username, keypath=self.keypath, ip=self.ip)
 
-                        elif type(self) == dagon.remote.CloudTask:
+                        elif isinstance(self, dagon.remote.CloudTask):
                             parallel_task = DagonTask(taskType, taskParallelName, cmd, provider=self.provider,
-                                                      ssh_username=self.ssh_username, key_options=self.key_options,
-                                                      instance_id=self.instance_id, instance_flavour=self.instance_flavour,
-                                                      instance_name=self.instance_name, stop_instance=self.stop_instance)
+                                                    ssh_username=self.ssh_username, key_options=self.key_options,
+                                                    instance_id=self.instance_id, instance_flavour=self.instance_flavour,
+                                                    instance_name=self.instance_name, stop_instance=self.stop_instance)
 
-                        elif type(self) == dagon.docker_task.DockerTask:
+                        elif isinstance(self, dagon.docker_task.DockerTask):
                             parallel_task = DagonTask(taskType, taskParallelName, cmd, image=self.image,
-                                                      container_id=self.container_id, remove=self.remove,
-                                                      volume=self.volume, transversal_workflow=self.transversal_workflow)
+                                                    container_id=self.container_id, remove=self.remove,
+                                                    volume=self.volume, transversal_workflow=self.transversal_workflow)
 
-                        elif type(self) == dagon.docker_task.DockerRemoteTask:
+                        elif isinstance(self, dagon.docker_task.DockerRemoteTask):
                             parallel_task = DagonTask(taskType, taskParallelName, cmd, image=self.image,
-                                                      container_id=self.container_id, ssh_username=self.ssh_username,
-                                                      keypath=self.keypath, ip=self.ip,
-                                                      remove=self.remove, volume=self.volume,
-                                                      transversal_workflow=self.transversal_workflow)
+                                                    container_id=self.container_id, ssh_username=self.ssh_username,
+                                                    keypath=self.keypath, ip=self.ip,
+                                                    remove=self.remove, volume=self.volume,
+                                                    transversal_workflow=self.transversal_workflow)
 
                         self.workflow.add_task(parallel_task)
                         self.new_tasks.append(parallel_task)
@@ -696,17 +736,18 @@ class Task(Thread):
                         if self in next_task.prevs:
                             next_task.prevs.remove(self)
 
-                        for new_task in self.new_tasks:
-                            next_task.add_dependency_to(new_task)
+                    for new_task in self.new_tasks:
+                        next_task.add_dependency_to(new_task)
 
                     self.workflow.make_dependencies()
 
                     body = "echo \"Starting parallel tasks...\"\n"
-                    body += "ln -sf " + quote(dst_path + "/" + local_path) + " " + quote(self.get_scratch_dir())
+                    if not is_absolute:
+                        body += "ln -sf " + quote(dst_path + "/" + local_path) + " " + quote(self.get_scratch_dir())
                 else:
                     # Change the body of the command
                     body = body.replace(
-                        dagon.Workflow.SCHEMA + arg, dst_path + "/" + local_path)
+                        dagon.Workflow.SCHEMA + arg, target_read_path)
             pos = pos2
 
         # Invoke the command
@@ -714,15 +755,23 @@ class Task(Thread):
         header = header + self.include_command(body)
         header = header + "if [ $? -ne 0 ]; then code=1; fi"
         return header
+    
 
     # process the command to execute
     def include_command(self, body):
         """
         Include the command to execute in the script body
-        :param body: Script body
-        :return: Script body with the command
         """
-        return "{ " + body + " || kill -9 $$ ; } | tee " + quote(self.working_dir + "/.dagon/stdout.txt") + "\n"
+        script = (
+            "{\n"
+            "  if ! {\n"
+            f"    {body}\n"
+            "  }; then\n"
+            "    kill -9 $$\n"
+            "  fi\n"
+            "} | tee " + quote(self.working_dir + "/.dagon/stdout.txt") + "\n"
+        )
+        return script
 
     # Post process the command
     def post_process_command(self, command):

@@ -608,9 +608,18 @@ class Stager(object):
         else:  # best effort (SCP)
             data_mover = self.data_mover
 
-        src = src_task.get_scratch_dir() + "/" + local_path
+        if os.path.isabs(local_path):
+            self.logger.debug(f"local path is absolute: {local_path}")
+            src = local_path
+            dst = dst_path
+        else:
+            self.logger.debug(f"local path is relative: {local_path}")
+            src = src_task.get_scratch_dir() + "/" + local_path
+            dst = dst_path + "/" + os.path.dirname(os.path.abspath(local_path))
 
-        dst = dst_path + "/" + os.path.dirname(os.path.abspath(local_path))
+        self.logger.debug(f"src={src}, dst={dst}")
+
+        self.logger.debug(f"[stage_in] data_mover={data_mover}")
 
         # Check if the symbolic link have to be used...
         if data_mover == DataMover.GRIDFTP:
@@ -628,7 +637,10 @@ class Stager(object):
 
             #get filename from path 
             intermediate_filename = os.path.basename(local_path)
-            dst = dst_path + "/" + os.path.dirname(os.path.abspath(local_path)) + "/" + intermediate_filename
+            if os.path.isabs(local_path):
+                dst = os.path.join(dst_path, intermediate_filename)
+            else:
+                dst = dst_path + "/" + os.path.dirname(os.path.abspath(local_path)) + "/" + intermediate_filename
 
             gm.copy_data(src, dst, intermediate_filename)# + "/" + "data.tar.gz")
 
@@ -659,31 +671,56 @@ class Stager(object):
 
         # Check if the secure copy have to be used...
         elif data_mover == DataMover.SCP:
-            # Add the copy command
+            self.logger.debug(f"[stage_in] Running data mover with SCP protocol")
             command = command + "# Add the secure copy command\n"
+            
+            # Encapsulate environment definitions
+            h_conf = os.getenv("MOUNT_POINT_CONF")
+            if h_conf is not None:
+                h_conf = "export " + h_conf
+
+            h_preload = os.getenv("MOUNT_POINT_LPATH")
+            if h_preload is not None:
+                h_preload = "export " + h_preload
+
+            h_env = f"{h_conf} {h_preload}"
+            ssh_wrapper = os.getenv("SSH_WRAPPER")
+            if ssh_wrapper is not None:
+                ssh_wrapper = "-S" + ssh_wrapper
+
             if isinstance(src_task, RemoteTask):  # if source is accessible from destiny machine
                 # copy my public key
+                self.logger.debug(f"[stage_in] Source is accessible from destiny machine")
                 key = dst_task.get_public_key()
                 src_task.add_public_key(key)
                 key_path = dst_task.working_dir + "/.dagon/ssh_key"
+                
+                # Force remote environment instantiation using a target subsystem wrapper or an explicit ssh pipe sequence
                 source = remote_target(src_task.get_user(), src_task.get_ip(), '"$file"')
-                cmd = ("scp -r -o LogLevel=ERROR -o StrictHostKeyChecking=no "
-                       "-o UserKnownHostsFile=/dev/null -i " + quote(key_path) +
-                       " -r " + source + ' "$dst"\n\n')
+                
+                # Leverage modern OpenSSH SFTP subsystem execution flags to inject variables remotely if permitted                
+                cmd = (f"scp {ssh_wrapper} -r -o LogLevel=ERROR -o StrictHostKeyChecking=no "
+                    f"-o UserKnownHostsFile=/dev/null -i {quote(key_path)} "
+                    f"-r {source} \"$dst\"\n\n")
+                
+                # f"-o SetEnv={quote(h_conf)} -o SetEnv={quote(h_preload)} "        
                 if StagerMover(self.stager_mover) == StagerMover.PARALLEL:
                     source = remote_target(src_task.get_user(), src_task.get_ip(), "{}")
-                    cmd = ("scp -r -o LogLevel=ERROR -o StrictHostKeyChecking=no "
-                           "-o UserKnownHostsFile=/dev/null -i " + quote(key_path) +
-                           " -r " + source + ' "$dst"\n\n')
+                    cmd = (f"scp -r -o LogLevel=ERROR -o StrictHostKeyChecking=no "
+                           f"-o UserKnownHostsFile=/dev/null -i {quote(key_path)} "
+                           f"-r {source} \"$dst\"\n\n")
+                    
+                # f"-o SetEnv={quote(h_conf)} -o SetEnv={quote(h_preload)} "
+                           
                 command = command + self.generate_command(src, dst, cmd, self.stager_mover.value)
                 command += "\nif [ $? -ne 0 ]; then code=1; fi"
-                # command += "\n rm " + dst_task.working_dir + "/.dagon/ssh_key"
             else:  # if source is a local machine
-                # copy my public key
+                self.logger.debug(f"[stage_in] Source is a local machine")
                 key = src_task.get_public_key()
                 dst_task.add_public_key(key)
 
-                command_mkdir = "mkdir -p " + quote(dst_path + "/" + os.path.dirname(local_path)) + "\n\n"
+                command_mkdir = f"{h_env} mkdir -p " + quote(dst_path + "/" + os.path.dirname(local_path)) + "\n\n"
+                self.logger.debug(f"Making remote directory: {command_mkdir}")
                 res = dst_task.ssh_connection.execute_command(command_mkdir)
 
                 if res['code']:
@@ -691,15 +728,21 @@ class Stager(object):
 
                 key_path = src_task.working_dir + "/.dagon/ssh_key"
                 destination = remote_target(dst_task.get_user(), dst_task.get_ip(), '"$dst"')
-                cmd = ("scp -r -o LogLevel=ERROR -o StrictHostKeyChecking=no "
-                       "-o UserKnownHostsFile=/dev/null -i " + quote(key_path) +
-                       ' -r "$file" ' + destination + "\n\n")
+                
+                cmd = (f"scp {ssh_wrapper} -r -o LogLevel=ERROR -o StrictHostKeyChecking=no "
+                       f"-o UserKnownHostsFile=/dev/null -i {quote(key_path)} "
+                       f"-o SetEnv={quote(h_conf)} -o SetEnv={quote(h_preload)} "
+                       f'-r "$file" ' + destination + "\n\n")
+                       
                 if StagerMover(self.stager_mover) == StagerMover.PARALLEL:
                     destination = remote_target(dst_task.get_user(), dst_task.get_ip(), '"$dst"')
-                    cmd = ("scp -r -o LogLevel=ERROR -o StrictHostKeyChecking=no "
-                           "-o UserKnownHostsFile=/dev/null -i " + quote(key_path) +
-                           " -r {} " + destination + "\n\n")
+                    cmd = (f"scp {ssh_wrapper} -r -o LogLevel=ERROR -o StrictHostKeyChecking=no "
+                           f"-o UserKnownHostsFile=/dev/null -i {quote(key_path)} "
+                           f"-o SetEnv={quote(h_conf)} -o SetEnv={quote(h_preload)} "
+                           f" -r {{}} " + destination + "\n\n")
+
                 command_local = self.generate_command(src, dst, cmd, self.stager_mover.value)
+                self.logger.debug(f"Copying file in remote directory: {command_local}")
                 res = Batch.execute_command(command_local)
 
                 if res['code']:
