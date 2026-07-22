@@ -33,6 +33,9 @@ if __name__ == '__main__':
         os.environ['MOUNT_POINT_LPATH'] = h_preload
         print(f"MOUNT_POINT_LPATH={h_preload}")
 
+    # directory used for IO operations.
+    os.environ["MOUNT_POINT"] = output_dir
+
     # TODO: here can be defined SSH_WRAPPER as enviroment variable used for scp integration with Hercules.
     # if h_ssh_wrapper is not None:
     #     os.environ['SSH_WRAPPER'] = h_preload
