@@ -1,4 +1,5 @@
 import os
+import subprocess
 from sys import argv, exit
 from dagon import Workflow
 from dagon.task import DagonTask, TaskType
@@ -67,34 +68,55 @@ if __name__ == "__main__":
     # output_dir = "/mnt/hercules/"
     req_dir = f"{base_dir}/requirements"
 
-    # Define cluster nodes for computational load distribution
-    # HERCULES_MPI_HOSTFILE_NAME is an enviroment variable to the path of the hostname
-    hostfile_path = os.getenv("HERCULES_MPI_HOSTFILE_NAME")
-    if not hostfile_path:
-        print("Error: HERCULES_MPI_HOSTFILE_NAME is undefined.")
+    # Define cluster nodes for computational load distribution.
+    # Determine the exact list of nodes reserved by Slurm (SLURM_JOB_NODELIST / SLURM_NODELIST),
+    # falling back to HERCULES_MPI_HOSTFILE_NAME when running outside of Slurm.
+    slurm_nodelist = os.getenv("SLURM_JOB_NODELIST") or os.getenv("SLURM_NODELIST")
+    lines = []
+
+    if slurm_nodelist:
+        # Resolve Slurm nodelist to individual hostnames using scontrol
+        try:
+            res = subprocess.run(
+                ["scontrol", "show", "hostnames", slurm_nodelist],
+                capture_output=True, text=True, check=True
+            )
+            lines = [h.strip() for h in res.stdout.splitlines() if h.strip()]
+        except Exception:
+            pass
+
+    # Fallback to HERCULES_MPI_HOSTFILE_NAME if outside Slurm or nodelist not detected
+    if not lines:
+        hostfile_path = os.getenv("HERCULES_MPI_HOSTFILE_NAME")
+        if hostfile_path and os.path.exists(hostfile_path):
+            try:
+                with open(hostfile_path, 'r') as f:
+                    lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+            except IOError as e:
+                print(f"I/O Exception reading hostfile: {e}")
+                exit(1)
+
+    # Restrict to SLURM_NNODES if set
+    slurm_nnodes = os.getenv("SLURM_NNODES") or os.getenv("SLURM_JOB_NUM_NODES")
+    if slurm_nnodes and len(lines) > int(slurm_nnodes):
+        try:
+            lines = lines[:int(slurm_nnodes)]
+        except ValueError:
+            pass
+
+    if not lines:
+        print("Error: Could not determine reserved nodes from Slurm (SLURM_JOB_NODELIST) or HERCULES_MPI_HOSTFILE_NAME.")
         exit(1)
 
-    if not os.path.exists(hostfile_path):
-        print(f"Error: HERCULES_MPI_HOSTFILE_NAME is invalid: {hostfile_path}")
-        exit(1)
-
-
+    # Fill cluster_nodes with repeated nodes if there are not enough lines
     cluster_nodes = []
-    try:
-        with open(hostfile_path, 'r') as f:
-            for line in f:
-                node_ip = line.strip()
-                if node_ip and not node_ip.startswith('#'):
-                    cluster_nodes.append({"ip": node_ip, "user": "gesanche"})
-    except IOError as e:
-        print(f"I/O Exception reading hostfile: {e}")
-        exit(1)
+    num_chunks = len(range(total_init, total_end + 1, chunk_size))
+    total_nodes = max(len(lines), num_chunks)
+    for i in range(total_nodes):
+        node_ip = lines[i % len(lines)]
+        cluster_nodes.append({"ip": node_ip, "user": "gesanche"})
 
     print(f"Detected Nodes: {cluster_nodes}")
-
-    if not cluster_nodes:
-        print("Error: Hostfile contains no valid node entries.")
-        exit(1)
     num_nodes = len(cluster_nodes)
 
     # Construct chunked tasks to execute workflow streams in parallel
