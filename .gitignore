@@ -148,3 +148,10 @@ tests/case_study_pollution/cloud/*.png
 tests/case_study_pollution/cloud/*.csv
 tests/benchmarks/dynostore/dagonresults/*
 tests/out.txt
+
+# scratch directories
+**/scratch/**
+
+# other extensions
+*.h5
+*.out
