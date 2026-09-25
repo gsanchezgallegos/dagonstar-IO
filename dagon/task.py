@@ -719,6 +719,10 @@ class Task(Thread):
 
         self.logger.debug(f"I/O directory: {h_mount_point}")
 
+        if h_mount_point is not None and h_mount_point != self.working_dir:
+            header = header + "mkdir -p " + h_mount_point + "\n"
+        header = header + "mkdir -p " + self.working_dir + "\n"
+        header = header + "mkdir -p " + self.working_dir + "/.dagon\n"
         header = header + "cd " + self.working_dir + "\n"
         header = header + "if [ $? -ne 0 ]; then code=1; fi \n\n"
 
@@ -765,15 +769,14 @@ class Task(Thread):
             self.logger.debug(f"task_name={task_name}")
 
             # Identify if the path explicitly requests absolute routing via double slash
-            is_absolute = len(elements) > 2 and elements[2] == "/"
+            is_absolute = len(elements) > 2 and (elements[2] == "/" or elements[2] == "")
 
             if is_absolute:
                 # Extract the raw absolute path from the source task
                 local_path = "/" + "/".join(elements[3:])
             else:
-                # # Get the rest of the string as local path
-                # local_path = "/" + "/".join(elements[2:])
-                local_path = None
+                # Get the rest of the string as local relative path
+                local_path = "/".join(elements[2:])
 
             # Set the default workflow name if needed
             if workflow_name is None or workflow_name == "":
@@ -968,14 +971,17 @@ class Task(Thread):
         :return: execution result
         :rtype: dict() with the execution output (str) and code (int)
         """
-        # The launcher script name
-        script_name = self.working_dir + "/.dagon/" + script_name
-        # Create a temporary launcher script
-        file = open(script_name, "w")
-        file.write(script)
-        file.flush()
-        file.close()
-        chmod(script_name, 0o744)
+        # TODO: change /mnt/hercules/ to a dynamic variable.
+        if self.working_dir.startswith("/mnt/hercules"):
+            dir_path = f"/tmp/dagon-launchers/{self.workflow.name}-{self.name}"
+        else:
+            dir_path = self.working_dir + "/.dagon"
+        makedirs(dir_path, exist_ok=True)
+        full_path = dir_path + "/" + script_name
+        with open(full_path, "w") as file:
+            file.write(script)
+        chmod(full_path, 0o744)
+        self.launcher_script_path = full_path
 
     # create path using mkdirs
     def mkdir_working_dir(self, path):
@@ -985,7 +991,12 @@ class Task(Thread):
         :param path: Path to the working directory
         :type path: str
         """
-        makedirs(path, exist_ok=True)
+        # TODO: change /mnt/hercules/ to a dynamic variable.
+        if not path.startswith("/mnt/hercules"):
+            try:
+                makedirs(path, exist_ok=True)
+            except OSError:
+                pass
 
     def create_working_dir(self):
         """

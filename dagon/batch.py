@@ -1,3 +1,4 @@
+import os
 import shlex
 from typing import Any, List, Optional, Union
 
@@ -104,7 +105,19 @@ class Batch(Task):
         """
         # Invoke the base method
         super(Batch, self).on_execute(script, script_name)
-        return Batch.execute_command(join_command(("bash", self.working_dir + "/.dagon/" + script_name)))
+        launcher = getattr(self, "launcher_script_path", self.working_dir + "/.dagon/" + script_name)
+
+        cmd_args = []
+        h_conf = os.getenv("MOUNT_POINT_CONF")
+        h_preload = os.getenv("MOUNT_POINT_LPATH")
+        if h_conf or h_preload:
+            cmd_args.append("env")
+            if h_conf:
+                cmd_args.append(h_conf)
+            if h_preload:
+                cmd_args.append(h_preload)
+        cmd_args.extend(["bash", launcher])
+        return Batch.execute_command(join_command(cmd_args))
 
     # returns public key
     def get_public_key(self) -> str:

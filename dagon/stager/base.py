@@ -104,7 +104,8 @@ class Stager(object):
         # get tasks info and select transference protocol
         dst_task_info = dst_task.get_info()
         src_task_info = src_task.get_info()
-        
+
+
         # check transference protocols and remote machine info if is available
         if dst_task_info is not None and src_task_info is not None:
             if dst_task_info['ip'] == src_task_info['ip']:
@@ -131,7 +132,8 @@ class Stager(object):
         else:
             self.logger.debug(f"local path is relative: {local_path}")
             src = src_task.get_scratch_dir() + "/" + local_path
-            dst = dst_path + "/" + os.path.dirname(os.path.abspath(local_path))
+            rel_dir = os.path.dirname(local_path)
+            dst = dst_path + ("/" + rel_dir if rel_dir else "")
 
         self.logger.debug(f"src={src}, dst={dst}")
 
@@ -278,6 +280,13 @@ class Stager(object):
 
 src={src}
 dst={dst}
+mkdir -p "$dst"
+if [ -d "$src" ]; then
+    dst_target="$dst/$(basename "$src")"
+    mkdir -p "$dst_target"
+else
+    dst_target="$dst"
+fi
 mode={mode}
 jobs={jobs}
 partition={partition}
@@ -290,7 +299,19 @@ cmd="{cmd}"
 case $mode in
     1)
     # Run in parallel using local queue
-    find $src -type f,l | parallel -j$jobs "$cmd"
+    if [ -d "$src" ]; then
+        if command -v parallel >/dev/null 2>&1; then
+            find "$src" -mindepth 1 -maxdepth 1 | parallel -j"$jobs" cp -r {{}} "$dst_target/"
+        else
+            find "$src" -mindepth 1 -maxdepth 1 | xargs -P "$jobs" -I {{}} cp -r {{}} "$dst_target/"
+        fi
+    else
+        if command -v parallel >/dev/null 2>&1; then
+            ls -d $src 2>/dev/null | parallel -j"$jobs" "$cmd"
+        else
+            ls -d $src 2>/dev/null | xargs -P "$jobs" -I {{}} sh -c "$cmd"
+        fi
+    fi
     break
     ;;
     2)
